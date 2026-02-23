@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "crates/aspen-wasm-guest-sdk",
+]
+resolver = "3"
