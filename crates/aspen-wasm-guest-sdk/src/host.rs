@@ -945,3 +945,103 @@ fn decode_tagged_unit_result(result: &str) -> Result<(), String> {
         Err(result.to_string())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pack_two_vecs_roundtrip() {
+        let first = b"hello";
+        let second = b"world";
+        let packed = pack_two_vecs(first, second);
+
+        // Verify layout: [4-byte LE len of first] ++ first ++ second
+        assert_eq!(packed.len(), 4 + first.len() + second.len());
+
+        let first_len = u32::from_le_bytes(packed[..4].try_into().unwrap()) as usize;
+        assert_eq!(first_len, first.len());
+        assert_eq!(&packed[4..4 + first_len], first);
+        assert_eq!(&packed[4 + first_len..], second);
+    }
+
+    #[test]
+    fn test_pack_two_vecs_empty_first() {
+        let packed = pack_two_vecs(b"", b"data");
+        assert_eq!(packed.len(), 4 + 4);
+        let first_len = u32::from_le_bytes(packed[..4].try_into().unwrap()) as usize;
+        assert_eq!(first_len, 0);
+        assert_eq!(&packed[4..], b"data");
+    }
+
+    #[test]
+    fn test_pack_two_vecs_empty_second() {
+        let packed = pack_two_vecs(b"data", b"");
+        assert_eq!(packed.len(), 4 + 4);
+        let first_len = u32::from_le_bytes(packed[..4].try_into().unwrap()) as usize;
+        assert_eq!(first_len, 4);
+        assert_eq!(&packed[4..], b"data");
+    }
+
+    #[test]
+    fn test_pack_two_vecs_both_empty() {
+        let packed = pack_two_vecs(b"", b"");
+        assert_eq!(packed.len(), 4);
+        let first_len = u32::from_le_bytes(packed[..4].try_into().unwrap()) as usize;
+        assert_eq!(first_len, 0);
+    }
+
+    #[test]
+    fn test_decode_tagged_option_result_found() {
+        let mut data = vec![0x00];
+        data.extend_from_slice(b"value");
+        let result = decode_tagged_option_result(&data);
+        assert_eq!(result.unwrap().unwrap(), b"value");
+    }
+
+    #[test]
+    fn test_decode_tagged_option_result_not_found() {
+        let result = decode_tagged_option_result(&[0x01]);
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_decode_tagged_option_result_error() {
+        let mut data = vec![0x02];
+        data.extend_from_slice(b"something broke");
+        let result = decode_tagged_option_result(&data);
+        assert_eq!(result.unwrap_err(), "something broke");
+    }
+
+    #[test]
+    fn test_decode_tagged_option_result_empty() {
+        let result = decode_tagged_option_result(&[]);
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_decode_tagged_unit_result_success_empty() {
+        assert!(decode_tagged_unit_result("").is_ok());
+    }
+
+    #[test]
+    fn test_decode_tagged_unit_result_success_null_prefix() {
+        assert!(decode_tagged_unit_result("\0ok").is_ok());
+    }
+
+    #[test]
+    fn test_decode_tagged_unit_result_error() {
+        let result = decode_tagged_unit_result("\x01oops");
+        assert_eq!(result.unwrap_err(), "oops");
+    }
+
+    #[test]
+    fn test_decode_tagged_unit_result_no_prefix_is_error() {
+        let result = decode_tagged_unit_result("unexpected");
+        assert_eq!(result.unwrap_err(), "unexpected");
+    }
+}
