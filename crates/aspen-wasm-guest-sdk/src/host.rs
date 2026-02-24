@@ -16,7 +16,7 @@ unsafe extern "C" {
     fn kv_put(key: String, value: Vec<u8>) -> String;
     fn kv_delete(key: String) -> String;
     fn kv_scan(prefix: String, limit: u32) -> Vec<u8>;
-    fn kv_cas(key: String, expected: Vec<u8>, new_value: Vec<u8>) -> String;
+    fn kv_cas(key: String, packed_params: Vec<u8>) -> String;
     fn kv_batch(ops: Vec<u8>) -> String;
     fn blob_has(hash: String) -> bool;
     fn blob_get(hash: String) -> Vec<u8>;
@@ -26,7 +26,7 @@ unsafe extern "C" {
     fn is_leader() -> bool;
     fn leader_id() -> u64;
     fn sign(data: Vec<u8>) -> Vec<u8>;
-    fn verify(key: String, data: Vec<u8>, sig: Vec<u8>) -> bool;
+    fn verify(key: String, packed_params: Vec<u8>) -> bool;
     fn public_key_hex() -> String;
     fn hlc_now() -> u64;
     fn schedule_timer(config: Vec<u8>) -> String;
@@ -122,8 +122,14 @@ pub fn kv_scan_prefix(prefix: &str, limit: u32) -> Result<Vec<(String, Vec<u8>)>
 /// Returns `Ok(())` if the swap succeeded or `Err(message)` on failure.
 ///
 /// The host uses the `\0`/`\x01` tag prefix convention.
+///
+/// Parameters are packed into a single `Vec<u8>` because hyperlight's
+/// primitive-mode ABI requires `VecBytes` to be followed by `Int` (length),
+/// so multiple `Vec<u8>` params in one function signature are invalid.
+/// Packing: `[4-byte expected_len (LE)] ++ expected ++ new_value`
 pub fn kv_compare_and_swap(key: &str, expected: &[u8], new_value: &[u8]) -> Result<(), String> {
-    let result = unsafe { kv_cas(key.to_string(), expected.to_vec(), new_value.to_vec()) };
+    let packed = pack_two_vecs(expected, new_value);
+    let result = unsafe { kv_cas(key.to_string(), packed) };
     decode_tagged_unit_result(&result)
 }
 
@@ -183,8 +189,12 @@ pub fn sign_data(data: &[u8]) -> Vec<u8> {
 }
 
 /// Verify an Ed25519 signature using a hex-encoded public key.
+///
+/// Parameters are packed because hyperlight's ABI forbids multiple
+/// `Vec<u8>` params. Packing: `[4-byte data_len (LE)] ++ data ++ sig`
 pub fn verify_signature(public_key_hex: &str, data: &[u8], signature: &[u8]) -> bool {
-    unsafe { verify(public_key_hex.to_string(), data.to_vec(), signature.to_vec()) }
+    let packed = pack_two_vecs(data, signature);
+    unsafe { verify(public_key_hex.to_string(), packed) }
 }
 
 /// Get the host node's Ed25519 public key as a hex string.
@@ -873,6 +883,22 @@ pub fn execute_service_raw(request_json: &str) -> String {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Pack two byte slices into a single `Vec<u8>` with a 4-byte LE length prefix.
+///
+/// Format: `[4-byte first_len (LE)] ++ first ++ second`
+///
+/// This is needed because hyperlight's primitive-mode ABI encodes `Vec<u8>` as
+/// `(VecBytes, Int)` and requires `VecBytes` to be immediately followed by `Int`.
+/// Multiple `Vec<u8>` parameters in one function signature would produce
+/// `VecBytes, VecBytes` which triggers "Host function vector parameter missing length".
+fn pack_two_vecs(first: &[u8], second: &[u8]) -> Vec<u8> {
+    let mut packed = Vec::with_capacity(4 + first.len() + second.len());
+    packed.extend_from_slice(&(first.len() as u32).to_le_bytes());
+    packed.extend_from_slice(first);
+    packed.extend_from_slice(second);
+    packed
+}
 
 /// Decode a tagged `Result<Option<Vec<u8>>, String>` from a host function.
 ///
