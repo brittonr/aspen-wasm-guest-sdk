@@ -13,23 +13,23 @@ unsafe extern "C" {
     fn log_warn(msg: String);
     fn now_ms() -> u64;
     fn kv_get(key: String) -> Vec<u8>;
-    fn kv_put(key: String, value: Vec<u8>) -> String;
+    fn kv_put(key: String, value: Vec<u8>, value_len: i32) -> String;
     fn kv_delete(key: String) -> String;
     fn kv_scan(prefix: String, limit: u32) -> Vec<u8>;
-    fn kv_cas(key: String, packed_params: Vec<u8>) -> String;
-    fn kv_batch(ops: Vec<u8>) -> String;
+    fn kv_cas(key: String, packed_params: Vec<u8>, packed_len: i32) -> String;
+    fn kv_batch(ops: Vec<u8>, ops_len: i32) -> String;
     fn blob_has(hash: String) -> bool;
     fn blob_get(hash: String) -> Vec<u8>;
-    fn blob_put(data: Vec<u8>) -> String;
+    fn blob_put(data: Vec<u8>, data_len: i32) -> String;
     fn node_id() -> u64;
     fn random_bytes(count: u32) -> Vec<u8>;
     fn is_leader() -> bool;
     fn leader_id() -> u64;
-    fn sign(data: Vec<u8>) -> Vec<u8>;
-    fn verify(key: String, packed_params: Vec<u8>) -> bool;
+    fn sign(data: Vec<u8>, data_len: i32) -> Vec<u8>;
+    fn verify(key: String, packed_params: Vec<u8>, packed_len: i32) -> bool;
     fn public_key_hex() -> String;
     fn hlc_now() -> u64;
-    fn schedule_timer(config: Vec<u8>) -> String;
+    fn schedule_timer(config: Vec<u8>, config_len: i32) -> String;
     fn cancel_timer(name: String) -> String;
     fn hook_subscribe(pattern: String) -> String;
     fn hook_unsubscribe(pattern: String) -> String;
@@ -83,7 +83,9 @@ pub fn kv_get_value(key: &str) -> Result<Option<Vec<u8>>, String> {
 /// The host uses the `\0`/`\x01` tag prefix convention:
 /// `\0` = success, `\x01` + message = error.
 pub fn kv_put_value(key: &str, value: &[u8]) -> Result<(), String> {
-    let result = unsafe { kv_put(key.to_string(), value.to_vec()) };
+    let v = value.to_vec();
+    let len = v.len() as i32;
+    let result = unsafe { kv_put(key.to_string(), v, len) };
     decode_tagged_unit_result(&result)
 }
 
@@ -129,7 +131,8 @@ pub fn kv_scan_prefix(prefix: &str, limit: u32) -> Result<Vec<(String, Vec<u8>)>
 /// Packing: `[4-byte expected_len (LE)] ++ expected ++ new_value`
 pub fn kv_compare_and_swap(key: &str, expected: &[u8], new_value: &[u8]) -> Result<(), String> {
     let packed = pack_two_vecs(expected, new_value);
-    let result = unsafe { kv_cas(key.to_string(), packed) };
+    let len = packed.len() as i32;
+    let result = unsafe { kv_cas(key.to_string(), packed, len) };
     decode_tagged_unit_result(&result)
 }
 
@@ -152,7 +155,9 @@ pub fn blob_get_data(hash: &str) -> Result<Option<Vec<u8>>, String> {
 /// The host uses a convention where the first byte of the result string
 /// signals success (`\0` prefix -> ok, hash follows) or error (`\x01` prefix).
 pub fn blob_put_data(data: &[u8]) -> Result<String, String> {
-    let result = unsafe { blob_put(data.to_vec()) };
+    let v = data.to_vec();
+    let len = v.len() as i32;
+    let result = unsafe { blob_put(v, len) };
     if let Some(stripped) = result.strip_prefix('\x01') {
         Err(stripped.to_string())
     } else if let Some(stripped) = result.strip_prefix('\0') {
@@ -185,7 +190,9 @@ pub fn get_leader_id() -> u64 {
 
 /// Sign data with the host node's Ed25519 secret key.
 pub fn sign_data(data: &[u8]) -> Vec<u8> {
-    unsafe { sign(data.to_vec()) }
+    let v = data.to_vec();
+    let len = v.len() as i32;
+    unsafe { sign(v, len) }
 }
 
 /// Verify an Ed25519 signature using a hex-encoded public key.
@@ -194,7 +201,8 @@ pub fn sign_data(data: &[u8]) -> Vec<u8> {
 /// `Vec<u8>` params. Packing: `[4-byte data_len (LE)] ++ data ++ sig`
 pub fn verify_signature(public_key_hex: &str, data: &[u8], signature: &[u8]) -> bool {
     let packed = pack_two_vecs(data, signature);
-    unsafe { verify(public_key_hex.to_string(), packed) }
+    let len = packed.len() as i32;
+    unsafe { verify(public_key_hex.to_string(), packed, len) }
 }
 
 /// Get the host node's Ed25519 public key as a hex string.
@@ -221,7 +229,8 @@ pub fn hlc_now_ms() -> u64 {
 /// preventing inconsistent intermediate states.
 pub fn kv_batch_write(ops: &[aspen_plugin_api::KvBatchOp]) -> Result<(), String> {
     let json = serde_json::to_vec(ops).map_err(|e| format!("failed to serialize batch: {e}"))?;
-    let result = unsafe { kv_batch(json) };
+    let len = json.len() as i32;
+    let result = unsafe { kv_batch(json, len) };
     decode_tagged_unit_result(&result)
 }
 
@@ -237,7 +246,8 @@ pub fn kv_batch_write(ops: &[aspen_plugin_api::KvBatchOp]) -> Result<(), String>
 /// Intervals are clamped to \[1s, 24h\]. Maximum 16 active timers per plugin.
 pub fn schedule_timer_on_host(config: &aspen_plugin_api::TimerConfig) -> Result<(), String> {
     let json = serde_json::to_vec(config).map_err(|e| format!("failed to serialize timer config: {e}"))?;
-    let result = unsafe { schedule_timer(json) };
+    let len = json.len() as i32;
+    let result = unsafe { schedule_timer(json, len) };
     decode_tagged_unit_result(&result)
 }
 
