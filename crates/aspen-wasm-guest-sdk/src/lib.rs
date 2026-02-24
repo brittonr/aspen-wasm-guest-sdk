@@ -20,6 +20,7 @@
 //!         PluginInfo {
 //!             name: "echo".into(),
 //!             version: "0.1.0".into(),
+//!             description: Some("Echo plugin for testing".into()),
 //!             handles: vec!["Echo".into()],
 //!             priority: 900,
 //!             app_id: None,
