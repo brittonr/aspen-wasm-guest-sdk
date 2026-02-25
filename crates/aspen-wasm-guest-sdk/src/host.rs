@@ -86,6 +86,10 @@ unsafe extern "C" {
 
     // Generic service
     fn service_execute(request_json: *const c_char) -> *const c_char;
+
+    // API version & capabilities
+    fn query_host_api_version() -> *const c_char;
+    fn host_capabilities() -> *const c_char;
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +841,57 @@ pub fn execute_service(
 pub fn execute_service_raw(request_json: &str) -> String {
     let c = to_cstr(request_json);
     unsafe { read_cstr_return(service_execute(c.as_ptr())) }
+}
+
+// ---------------------------------------------------------------------------
+// API Version & Capabilities
+// ---------------------------------------------------------------------------
+
+/// Query the host's plugin API version.
+///
+/// Returns a semver version string (e.g., "0.2.0"). Plugins can use this
+/// at init time to adapt behavior for different host versions or log a
+/// warning if the host is older than expected.
+///
+/// # Example
+///
+/// ```no_run
+/// let version = aspen_wasm_guest_sdk::host::get_host_api_version();
+/// if version != "0.2.0" {
+///     aspen_wasm_guest_sdk::host::warn(&format!("expected API 0.2.0, got {version}"));
+/// }
+/// ```
+pub fn get_host_api_version() -> String {
+    unsafe { read_cstr_return(query_host_api_version()) }
+}
+
+/// Query the host's available capabilities (host function names).
+///
+/// Returns a list of host function names that are registered and available
+/// for this plugin to call. Plugins can use this to probe for optional
+/// capabilities (e.g., `sql_query`, `hook_list`) before attempting to call
+/// them, avoiding runtime errors.
+///
+/// # Example
+///
+/// ```no_run
+/// let caps = aspen_wasm_guest_sdk::host::get_host_capabilities();
+/// if caps.contains(&"sql_query".to_string()) {
+///     // SQL queries are available on this node
+/// }
+/// ```
+pub fn get_host_capabilities() -> Vec<String> {
+    let json = unsafe { read_cstr_return(host_capabilities()) };
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+/// Check if a specific host capability is available.
+///
+/// Convenience wrapper around [`get_host_capabilities`]. Queries the host
+/// once and searches the result. For checking multiple capabilities, prefer
+/// calling `get_host_capabilities()` once and searching the list.
+pub fn has_capability(name: &str) -> bool {
+    get_host_capabilities().iter().any(|c| c == name)
 }
 
 // ---------------------------------------------------------------------------
