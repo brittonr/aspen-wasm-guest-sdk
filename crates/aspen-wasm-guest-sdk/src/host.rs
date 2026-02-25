@@ -179,8 +179,8 @@ pub fn hlc_now_ms() -> u64 {
 /// or `Err(message)` on error.
 ///
 /// Host encoding (String, base64-tagged):
-/// `\x00` + base64(value) = found, `\x01` = not-found,
-/// `\x02` + error_msg = error.
+/// `\x01` + base64(value) = found, `\x02` = not-found,
+/// `\x03` + error_msg = error.
 pub fn kv_get_value(key: &str) -> Result<Option<Vec<u8>>, String> {
     let c_key = to_cstr(key);
     let result = unsafe { read_cstr_return(kv_get(c_key.as_ptr())) };
@@ -208,7 +208,7 @@ pub fn kv_delete_key(key: &str) -> Result<(), String> {
 /// Returns a list of `(key, value)` pairs, JSON-decoded from the host response.
 ///
 /// Host encoding (String, base64-tagged):
-/// `\x00` + base64(json_bytes) = ok, `\x01` + error_msg = error.
+/// `\x01` + base64(json_bytes) = ok, `\x02` + error_msg = error.
 pub fn kv_scan_prefix(prefix: &str, limit: u32) -> Result<Vec<(String, Vec<u8>)>, String> {
     let c_prefix = to_cstr(prefix);
     let result = unsafe { read_cstr_return(kv_scan(c_prefix.as_ptr(), limit)) };
@@ -216,7 +216,7 @@ pub fn kv_scan_prefix(prefix: &str, limit: u32) -> Result<Vec<(String, Vec<u8>)>
         return Ok(Vec::new());
     }
     match result.as_bytes()[0] {
-        b'\x00' => {
+        b'\x01' => {
             // Decode base64 → JSON bytes → Vec<(String, Vec<u8>)>
             let b64 = &result[1..];
             if b64.is_empty() {
@@ -225,7 +225,7 @@ pub fn kv_scan_prefix(prefix: &str, limit: u32) -> Result<Vec<(String, Vec<u8>)>
             let bytes = base64_decode(b64).map_err(|e| format!("base64 decode failed: {e}"))?;
             Ok(serde_json::from_slice(&bytes).unwrap_or_default())
         }
-        b'\x01' => {
+        b'\x02' => {
             let msg = &result[1..];
             Err(msg.to_string())
         }
@@ -273,8 +273,8 @@ pub fn blob_exists(hash: &str) -> bool {
 /// or `Err(message)` on error.
 ///
 /// Host encoding (String, base64-tagged):
-/// `\x00` + base64(data) = found, `\x01` = not-found,
-/// `\x02` + error_msg = error.
+/// `\x01` + base64(data) = found, `\x02` = not-found,
+/// `\x03` + error_msg = error.
 pub fn blob_get_data(hash: &str) -> Result<Option<Vec<u8>>, String> {
     let c = to_cstr(hash);
     let result = unsafe { read_cstr_return(blob_get(c.as_ptr())) };
@@ -286,9 +286,9 @@ pub fn blob_put_data(data: &[u8]) -> Result<String, String> {
     let result = unsafe {
         read_cstr_return(blob_put(data.as_ptr(), data.len() as i32))
     };
-    if let Some(stripped) = result.strip_prefix('\x01') {
+    if let Some(stripped) = result.strip_prefix('\x02') {
         Err(stripped.to_string())
-    } else if let Some(stripped) = result.strip_prefix('\0') {
+    } else if let Some(stripped) = result.strip_prefix('\x01') {
         Ok(stripped.to_string())
     } else {
         // No prefix — treat entire string as the hash (backwards compat).
@@ -502,9 +502,9 @@ pub fn execute_sql(
     let c = to_cstr(&request_json);
     let result = unsafe { read_cstr_return(sql_query(c.as_ptr())) };
 
-    if let Some(json) = result.strip_prefix('\0') {
+    if let Some(json) = result.strip_prefix('\x01') {
         serde_json::from_str(json).map_err(|e| format!("failed to parse SQL result: {e}"))
-    } else if let Some(msg) = result.strip_prefix('\x01') {
+    } else if let Some(msg) = result.strip_prefix('\x02') {
         Err(msg.to_string())
     } else {
         Err(result)
@@ -598,9 +598,9 @@ pub struct KvConditionalBatchResult {
 fn kv_execute_raw(request_json: &str) -> Result<serde_json::Value, String> {
     let c = to_cstr(request_json);
     let result = unsafe { read_cstr_return(kv_execute(c.as_ptr())) };
-    if let Some(json_str) = result.strip_prefix('\0') {
+    if let Some(json_str) = result.strip_prefix('\x01') {
         serde_json::from_str(json_str).map_err(|e| format!("failed to parse kv_execute result: {e}"))
-    } else if let Some(err) = result.strip_prefix('\x01') {
+    } else if let Some(err) = result.strip_prefix('\x02') {
         Err(err.to_string())
     } else {
         Err(result)
@@ -855,9 +855,9 @@ fn pack_two_vecs(first: &[u8], second: &[u8]) -> Vec<u8> {
 
 /// Decode a tagged JSON result string. `\0{json}` = success, `\x01{error}` = error.
 fn decode_tagged_json_result<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, String> {
-    if let Some(json) = s.strip_prefix('\0') {
+    if let Some(json) = s.strip_prefix('\x01') {
         serde_json::from_str(json).map_err(|e| format!("parse result failed: {e}"))
-    } else if let Some(err) = s.strip_prefix('\x01') {
+    } else if let Some(err) = s.strip_prefix('\x02') {
         Err(err.to_string())
     } else {
         Err("unexpected host response format".to_string())
@@ -865,11 +865,11 @@ fn decode_tagged_json_result<T: serde::de::DeserializeOwned>(s: &str) -> Result<
 }
 
 /// Decode a tagged `Result<(), String>` from a host function.
-/// `\0` = success, `\x01` + msg = error, empty = success.
+/// `\x01` = success, `\x02` + msg = error, empty = success.
 fn decode_tagged_unit_result(result: &str) -> Result<(), String> {
-    if result.is_empty() || result.starts_with('\0') {
+    if result.is_empty() || result.starts_with('\x01') {
         Ok(())
-    } else if let Some(msg) = result.strip_prefix('\x01') {
+    } else if let Some(msg) = result.strip_prefix('\x02') {
         Err(msg.to_string())
     } else {
         Err(result.to_string())
@@ -878,14 +878,14 @@ fn decode_tagged_unit_result(result: &str) -> Result<(), String> {
 
 /// Decode a tagged option result where binary data is base64-encoded.
 ///
-/// Host encoding: `\x00` + base64(value) = found, `\x01` = not-found,
-/// `\x02` + error_msg = error, empty = not-found.
+/// Host encoding: `\x01` + base64(value) = found, `\x02` = not-found,
+/// `\x03` + error_msg = error, empty = not-found.
 fn decode_tagged_b64_option_result(result: &str) -> Result<Option<Vec<u8>>, String> {
     if result.is_empty() {
         return Ok(None);
     }
     match result.as_bytes()[0] {
-        b'\x00' => {
+        b'\x01' => {
             let b64 = &result[1..];
             if b64.is_empty() {
                 return Ok(Some(Vec::new()));
@@ -893,8 +893,8 @@ fn decode_tagged_b64_option_result(result: &str) -> Result<Option<Vec<u8>>, Stri
             let bytes = base64_decode(b64).map_err(|e| format!("base64 decode: {e}"))?;
             Ok(Some(bytes))
         }
-        b'\x01' => Ok(None),
-        b'\x02' => {
+        b'\x02' => Ok(None),
+        b'\x03' => {
             let msg = &result[1..];
             Err(msg.to_string())
         }
@@ -1011,31 +1011,31 @@ mod tests {
     #[test]
     fn test_decode_tagged_unit_result_success() {
         assert!(decode_tagged_unit_result("").is_ok());
-        assert!(decode_tagged_unit_result("\0ok").is_ok());
+        assert!(decode_tagged_unit_result("\x01ok").is_ok());
     }
 
     #[test]
     fn test_decode_tagged_unit_result_error() {
-        assert_eq!(decode_tagged_unit_result("\x01oops").unwrap_err(), "oops");
+        assert_eq!(decode_tagged_unit_result("\x02oops").unwrap_err(), "oops");
     }
 
     #[test]
     fn test_decode_tagged_b64_option_found() {
-        // \x00 + base64("value") = found
-        let input = format!("\x00{}", base64_encode(b"value"));
+        // \x01 + base64("value") = found
+        let input = format!("\x01{}", base64_encode(b"value"));
         let result = decode_tagged_b64_option_result(&input);
         assert_eq!(result.unwrap().unwrap(), b"value");
     }
 
     #[test]
     fn test_decode_tagged_b64_option_not_found() {
-        let result = decode_tagged_b64_option_result("\x01");
+        let result = decode_tagged_b64_option_result("\x02");
         assert!(result.unwrap().is_none());
     }
 
     #[test]
     fn test_decode_tagged_b64_option_error() {
-        let result = decode_tagged_b64_option_result("\x02something broke");
+        let result = decode_tagged_b64_option_result("\x03something broke");
         assert_eq!(result.unwrap_err(), "something broke");
     }
 
