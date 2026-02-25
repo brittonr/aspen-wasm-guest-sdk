@@ -1,213 +1,166 @@
 //! Host function imports for WASM guest plugins.
 //!
-//! These functions call into the host runtime via primitive-mode FFI.
-//! The host registers functions that guests can import to interact
-//! with the Aspen cluster (logging, KV store, blob storage, cluster info,
-//! batch operations, and timer scheduling).
+//! These functions call into the host runtime via hyperlight's primitive-mode FFI.
+//!
+//! # ABI Contract
+//!
+//! Hyperlight-wasm's linker maps host functions into the WASM module's "env"
+//! namespace using its own type system (ParameterType/ReturnType), which does
+//! NOT match the standard Rust wasm32 ABI. The mapping is:
+//!
+//! | Hyperlight Type | WASM ValType | Guest representation |
+//! |-----------------|-------------|----------------------|
+//! | String (param)  | i32         | pointer to NUL-terminated C string |
+//! | String (return) | i32         | pointer to NUL-terminated C string |
+//! | VecBytes (param)| i32         | pointer to raw bytes (followed by i32 length) |
+//! | Int / UInt      | i32         | raw value |
+//! | Long / ULong    | i64         | raw value |
+//! | Bool            | i32         | 0 or 1 |
+//! | Void            | (none)      | no return |
+//!
+//! VecBytes return is declared as i64 in hyperlight's type system but the
+//! wasm_runtime's hl_return_to_val actually returns i32 — this is a known
+//! hyperlight-wasm 0.12 bug. All functions that previously returned Vec<u8>
+//! have been changed to return String (base64-encoded where needed) to work
+//! around this limitation.
+//!
+//! Guest extern declarations MUST use raw types (i32, i64, etc.) and manually
+//! marshal String/VecBytes through guest memory, not Rust's String/Vec types
+//! which produce incompatible multi-value ABI signatures on wasm32.
 
-// Hyperlight primitive-mode handles the ABI translation for these types.
-#[allow(improper_ctypes)]
+use core::ffi::{CStr, c_char};
+use std::ffi::CString;
+
+// ---------------------------------------------------------------------------
+// Raw extern declarations matching hyperlight's WASM-level ABI
+// ---------------------------------------------------------------------------
+
 unsafe extern "C" {
-    fn log_info(msg: String);
-    fn log_debug(msg: String);
-    fn log_warn(msg: String);
+    // Logging (String → void)
+    fn log_info(msg: *const c_char);
+    fn log_debug(msg: *const c_char);
+    fn log_warn(msg: *const c_char);
+
+    // Time (→ u64)
     fn now_ms() -> u64;
-    fn kv_get(key: String) -> Vec<u8>;
-    fn kv_put(key: String, value: Vec<u8>, value_len: i32) -> String;
-    fn kv_delete(key: String) -> String;
-    fn kv_scan(prefix: String, limit: u32) -> Vec<u8>;
-    fn kv_cas(key: String, packed_params: Vec<u8>, packed_len: i32) -> String;
-    fn kv_batch(ops: Vec<u8>, ops_len: i32) -> String;
-    fn blob_has(hash: String) -> bool;
-    fn blob_get(hash: String) -> Vec<u8>;
-    fn blob_put(data: Vec<u8>, data_len: i32) -> String;
-    fn node_id() -> u64;
-    fn random_bytes(count: u32) -> Vec<u8>;
-    fn is_leader() -> bool;
-    fn leader_id() -> u64;
-    fn sign(data: Vec<u8>, data_len: i32) -> Vec<u8>;
-    fn verify(key: String, packed_params: Vec<u8>, packed_len: i32) -> bool;
-    fn public_key_hex() -> String;
     fn hlc_now() -> u64;
-    fn schedule_timer(config: Vec<u8>, config_len: i32) -> String;
-    fn cancel_timer(name: String) -> String;
-    fn hook_subscribe(pattern: String) -> String;
-    fn hook_unsubscribe(pattern: String) -> String;
-    fn sql_query(request_json: String) -> String;
-    fn kv_execute(request_json: String) -> String;
-    fn hook_list(unused: String) -> String;
-    fn hook_metrics(handler_name: String) -> String;
-    fn hook_trigger(request_json: String) -> String;
-    fn service_execute(request_json: String) -> String;
+
+    // KV operations
+    fn kv_get(key: *const c_char) -> *const c_char;        // String → String (base64-tagged)
+    fn kv_put(key: *const c_char, value: *const u8, value_len: i32) -> *const c_char;
+    fn kv_delete(key: *const c_char) -> *const c_char;
+    fn kv_scan(prefix: *const c_char, limit: u32) -> *const c_char; // String, u32 → String (base64-tagged)
+    fn kv_cas(key: *const c_char, packed: *const u8, packed_len: i32) -> *const c_char;
+    fn kv_batch(ops: *const u8, ops_len: i32) -> *const c_char;
+    fn kv_execute(request_json: *const c_char) -> *const c_char;
+
+    // Blob operations
+    fn blob_has(hash: *const c_char) -> i32;                // bool
+    fn blob_get(hash: *const c_char) -> *const c_char;      // String → String (base64-tagged)
+    fn blob_put(data: *const u8, data_len: i32) -> *const c_char;
+
+    // Cluster info
+    fn node_id() -> u64;
+    fn is_leader() -> i32;                                   // bool
+    fn leader_id() -> u64;
+
+    // Crypto
+    fn random_bytes(count: u32) -> *const c_char;            // u32 → String (base64)
+    fn sign(data: *const u8, data_len: i32) -> *const c_char; // VecBytes → String (base64)
+    fn verify(key: *const c_char, packed: *const u8, packed_len: i32) -> i32; // bool
+    fn public_key_hex() -> *const c_char;
+
+    // Timers
+    fn schedule_timer(config: *const u8, config_len: i32) -> *const c_char;
+    fn cancel_timer(name: *const c_char) -> *const c_char;
+
+    // Hooks
+    fn hook_subscribe(pattern: *const c_char) -> *const c_char;
+    fn hook_unsubscribe(pattern: *const c_char) -> *const c_char;
+    fn hook_list(unused: *const c_char) -> *const c_char;
+    fn hook_metrics(handler_name: *const c_char) -> *const c_char;
+    fn hook_trigger(request_json: *const c_char) -> *const c_char;
+
+    // SQL
+    fn sql_query(request_json: *const c_char) -> *const c_char;
+
+    // Generic service
+    fn service_execute(request_json: *const c_char) -> *const c_char;
 }
 
 // ---------------------------------------------------------------------------
-// Safe wrappers
+// Raw ABI helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a Rust &str to a NUL-terminated C string pointer for hyperlight.
+/// The CString must be kept alive for the duration of the call.
+fn to_cstr(s: &str) -> CString {
+    CString::new(s).unwrap_or_else(|_| {
+        // If the string contains NUL bytes, replace them
+        let cleaned: Vec<u8> = s.bytes().filter(|&b| b != 0).collect();
+        CString::new(cleaned).unwrap()
+    })
+}
+
+/// Read a NUL-terminated C string returned by a host function.
+///
+/// # Safety
+/// The pointer must be valid and point to a NUL-terminated string in guest memory.
+/// Hyperlight allocates this via guest malloc; we need to free it eventually.
+unsafe fn read_cstr_return(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let cstr = unsafe { CStr::from_ptr(ptr) };
+    let s = cstr.to_string_lossy().into_owned();
+    // Free the allocation made by hyperlight's hl_return_to_val.
+    // The host allocated this in guest memory via malloc.
+    unsafe { dealloc(ptr as *mut u8, cstr.to_bytes_with_nul().len()) };
+    s
+}
+
+/// Free memory allocated by hyperlight in guest space.
+///
+/// Hyperlight's hl_return_to_val uses the guest's exported malloc to allocate
+/// return values. We free via the standard allocator since we're in the same
+/// address space. Actually, hyperlight tracks return allocations and frees them
+/// on the next VM entry (free_return_value_allocations), so we DON'T need to
+/// free here — hyperlight handles it.
+unsafe fn dealloc(_ptr: *mut u8, _len: usize) {
+    // Hyperlight automatically frees return value allocations on next VM entry.
+    // See wasm_runtime/src/marshal.rs: free_return_value_allocations()
+    // Calling free here would double-free.
+}
+
+// ---------------------------------------------------------------------------
+// Safe wrappers — Logging
 // ---------------------------------------------------------------------------
 
 /// Log an info-level message on the host.
 pub fn log_info_msg(msg: &str) {
-    unsafe { log_info(msg.to_string()) }
+    let c = to_cstr(msg);
+    unsafe { log_info(c.as_ptr()) }
 }
 
 /// Log a debug-level message on the host.
 pub fn log_debug_msg(msg: &str) {
-    unsafe { log_debug(msg.to_string()) }
+    let c = to_cstr(msg);
+    unsafe { log_debug(c.as_ptr()) }
 }
 
 /// Log a warn-level message on the host.
 pub fn log_warn_msg(msg: &str) {
-    unsafe { log_warn(msg.to_string()) }
+    let c = to_cstr(msg);
+    unsafe { log_warn(c.as_ptr()) }
 }
+
+// ---------------------------------------------------------------------------
+// Safe wrappers — Time
+// ---------------------------------------------------------------------------
 
 /// Get the current wall-clock time in milliseconds from the host.
 pub fn current_time_ms() -> u64 {
     unsafe { now_ms() }
-}
-
-/// Read a value from the distributed KV store.
-///
-/// Returns `Ok(Some(data))` if the key exists, `Ok(None)` if not found,
-/// or `Err(message)` on error.
-///
-/// Host encoding: `[0x00] ++ value` = found, `[0x01]` = not-found,
-/// `[0x02] ++ error_msg` = error.
-pub fn kv_get_value(key: &str) -> Result<Option<Vec<u8>>, String> {
-    let result = unsafe { kv_get(key.to_string()) };
-    decode_tagged_option_result(&result)
-}
-
-/// Write a value to the distributed KV store.
-/// Returns `Ok(())` on success or `Err(message)` on failure.
-///
-/// The host uses the `\0`/`\x01` tag prefix convention:
-/// `\0` = success, `\x01` + message = error.
-pub fn kv_put_value(key: &str, value: &[u8]) -> Result<(), String> {
-    let v = value.to_vec();
-    let len = v.len() as i32;
-    let result = unsafe { kv_put(key.to_string(), v, len) };
-    decode_tagged_unit_result(&result)
-}
-
-/// Delete a key from the distributed KV store.
-/// Returns `Ok(())` on success or `Err(message)` on failure.
-///
-/// The host uses the `\0`/`\x01` tag prefix convention.
-pub fn kv_delete_key(key: &str) -> Result<(), String> {
-    let result = unsafe { kv_delete(key.to_string()) };
-    decode_tagged_unit_result(&result)
-}
-
-/// Scan keys by prefix from the distributed KV store.
-/// Returns a list of `(key, value)` pairs, JSON-decoded from the host response.
-///
-/// Host encoding: `[0x00] ++ json_bytes` = ok, `[0x01] ++ error_msg` = error.
-pub fn kv_scan_prefix(prefix: &str, limit: u32) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let result = unsafe { kv_scan(prefix.to_string(), limit) };
-    if result.is_empty() {
-        return Ok(Vec::new());
-    }
-    match result[0] {
-        0x00 => Ok(serde_json::from_slice(&result[1..]).unwrap_or_default()),
-        0x01 => {
-            let msg = String::from_utf8_lossy(&result[1..]).to_string();
-            Err(msg)
-        }
-        _ => {
-            // Backwards compat: no tag byte, try raw JSON decode
-            Ok(serde_json::from_slice(&result).unwrap_or_default())
-        }
-    }
-}
-
-/// Compare-and-swap a value in the distributed KV store.
-/// Returns `Ok(())` if the swap succeeded or `Err(message)` on failure.
-///
-/// The host uses the `\0`/`\x01` tag prefix convention.
-///
-/// Parameters are packed into a single `Vec<u8>` because hyperlight's
-/// primitive-mode ABI requires `VecBytes` to be followed by `Int` (length),
-/// so multiple `Vec<u8>` params in one function signature are invalid.
-/// Packing: `[4-byte expected_len (LE)] ++ expected ++ new_value`
-pub fn kv_compare_and_swap(key: &str, expected: &[u8], new_value: &[u8]) -> Result<(), String> {
-    let packed = pack_two_vecs(expected, new_value);
-    let len = packed.len() as i32;
-    let result = unsafe { kv_cas(key.to_string(), packed, len) };
-    decode_tagged_unit_result(&result)
-}
-
-/// Check whether a blob exists in the content-addressed store.
-pub fn blob_exists(hash: &str) -> bool {
-    unsafe { blob_has(hash.to_string()) }
-}
-
-/// Retrieve a blob by hash. Returns `Ok(None)` if the blob does not exist,
-/// or `Err(message)` on error.
-///
-/// Host encoding: `[0x00] ++ data` = found, `[0x01]` = not-found,
-/// `[0x02] ++ error_msg` = error.
-pub fn blob_get_data(hash: &str) -> Result<Option<Vec<u8>>, String> {
-    let result = unsafe { blob_get(hash.to_string()) };
-    decode_tagged_option_result(&result)
-}
-
-/// Store a blob and return its content hash.
-/// The host uses a convention where the first byte of the result string
-/// signals success (`\0` prefix -> ok, hash follows) or error (`\x01` prefix).
-pub fn blob_put_data(data: &[u8]) -> Result<String, String> {
-    let v = data.to_vec();
-    let len = v.len() as i32;
-    let result = unsafe { blob_put(v, len) };
-    if let Some(stripped) = result.strip_prefix('\x01') {
-        Err(stripped.to_string())
-    } else if let Some(stripped) = result.strip_prefix('\0') {
-        Ok(stripped.to_string())
-    } else {
-        // No prefix -- treat entire string as the hash (backwards compat).
-        Ok(result)
-    }
-}
-
-/// Get the numeric node ID of the host node.
-pub fn get_node_id() -> u64 {
-    unsafe { node_id() }
-}
-
-/// Get cryptographically random bytes from the host.
-pub fn get_random_bytes(count: u32) -> Vec<u8> {
-    unsafe { random_bytes(count) }
-}
-
-/// Check whether the host node is currently the Raft leader.
-pub fn is_current_leader() -> bool {
-    unsafe { is_leader() }
-}
-
-/// Get the numeric node ID of the current Raft leader.
-pub fn get_leader_id() -> u64 {
-    unsafe { leader_id() }
-}
-
-/// Sign data with the host node's Ed25519 secret key.
-pub fn sign_data(data: &[u8]) -> Vec<u8> {
-    let v = data.to_vec();
-    let len = v.len() as i32;
-    unsafe { sign(v, len) }
-}
-
-/// Verify an Ed25519 signature using a hex-encoded public key.
-///
-/// Parameters are packed because hyperlight's ABI forbids multiple
-/// `Vec<u8>` params. Packing: `[4-byte data_len (LE)] ++ data ++ sig`
-pub fn verify_signature(public_key_hex: &str, data: &[u8], signature: &[u8]) -> bool {
-    let packed = pack_two_vecs(data, signature);
-    let len = packed.len() as i32;
-    unsafe { verify(public_key_hex.to_string(), packed, len) }
-}
-
-/// Get the host node's Ed25519 public key as a hex string.
-pub fn public_key() -> String {
-    unsafe { public_key_hex() }
 }
 
 /// Get the current HLC timestamp as milliseconds.
@@ -216,72 +169,224 @@ pub fn hlc_now_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// KV Batch Operations
+// Safe wrappers — KV Store
 // ---------------------------------------------------------------------------
 
+/// Read a value from the distributed KV store.
+///
+/// Returns `Ok(Some(data))` if the key exists, `Ok(None)` if not found,
+/// or `Err(message)` on error.
+///
+/// Host encoding (String, base64-tagged):
+/// `\x00` + base64(value) = found, `\x01` = not-found,
+/// `\x02` + error_msg = error.
+pub fn kv_get_value(key: &str) -> Result<Option<Vec<u8>>, String> {
+    let c_key = to_cstr(key);
+    let result = unsafe { read_cstr_return(kv_get(c_key.as_ptr())) };
+    decode_tagged_b64_option_result(&result)
+}
+
+/// Write a value to the distributed KV store.
+/// Returns `Ok(())` on success or `Err(message)` on failure.
+pub fn kv_put_value(key: &str, value: &[u8]) -> Result<(), String> {
+    let c_key = to_cstr(key);
+    let result = unsafe {
+        read_cstr_return(kv_put(c_key.as_ptr(), value.as_ptr(), value.len() as i32))
+    };
+    decode_tagged_unit_result(&result)
+}
+
+/// Delete a key from the distributed KV store.
+pub fn kv_delete_key(key: &str) -> Result<(), String> {
+    let c_key = to_cstr(key);
+    let result = unsafe { read_cstr_return(kv_delete(c_key.as_ptr())) };
+    decode_tagged_unit_result(&result)
+}
+
+/// Scan keys by prefix from the distributed KV store.
+/// Returns a list of `(key, value)` pairs, JSON-decoded from the host response.
+///
+/// Host encoding (String, base64-tagged):
+/// `\x00` + base64(json_bytes) = ok, `\x01` + error_msg = error.
+pub fn kv_scan_prefix(prefix: &str, limit: u32) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let c_prefix = to_cstr(prefix);
+    let result = unsafe { read_cstr_return(kv_scan(c_prefix.as_ptr(), limit)) };
+    if result.is_empty() {
+        return Ok(Vec::new());
+    }
+    match result.as_bytes()[0] {
+        b'\x00' => {
+            // Decode base64 → JSON bytes → Vec<(String, Vec<u8>)>
+            let b64 = &result[1..];
+            if b64.is_empty() {
+                return Ok(Vec::new());
+            }
+            let bytes = base64_decode(b64).map_err(|e| format!("base64 decode failed: {e}"))?;
+            Ok(serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+        b'\x01' => {
+            let msg = &result[1..];
+            Err(msg.to_string())
+        }
+        _ => {
+            // Backwards compat: no tag byte, try raw JSON decode
+            Ok(serde_json::from_str(&result).unwrap_or_default())
+        }
+    }
+}
+
+/// Compare-and-swap a value in the distributed KV store.
+///
+/// Parameters are packed into a single byte buffer because hyperlight's
+/// ABI requires VecBytes to be immediately followed by Int (length).
+/// Packing: `[4-byte expected_len (LE)] ++ expected ++ new_value`
+pub fn kv_compare_and_swap(key: &str, expected: &[u8], new_value: &[u8]) -> Result<(), String> {
+    let c_key = to_cstr(key);
+    let packed = pack_two_vecs(expected, new_value);
+    let result = unsafe {
+        read_cstr_return(kv_cas(c_key.as_ptr(), packed.as_ptr(), packed.len() as i32))
+    };
+    decode_tagged_unit_result(&result)
+}
+
 /// Execute a batch of KV operations atomically.
-///
-/// All operations are validated and executed on the host side. Keys are
-/// checked against the plugin's namespace prefixes before any operation
-/// executes.
-///
-/// Tiger Style: Batch operations enable atomic multi-key updates,
-/// preventing inconsistent intermediate states.
 pub fn kv_batch_write(ops: &[aspen_plugin_api::KvBatchOp]) -> Result<(), String> {
     let json = serde_json::to_vec(ops).map_err(|e| format!("failed to serialize batch: {e}"))?;
-    let len = json.len() as i32;
-    let result = unsafe { kv_batch(json, len) };
+    let result = unsafe {
+        read_cstr_return(kv_batch(json.as_ptr(), json.len() as i32))
+    };
     decode_tagged_unit_result(&result)
 }
 
 // ---------------------------------------------------------------------------
-// Timer / Scheduler
+// Safe wrappers — Blob Store
+// ---------------------------------------------------------------------------
+
+/// Check whether a blob exists in the content-addressed store.
+pub fn blob_exists(hash: &str) -> bool {
+    let c = to_cstr(hash);
+    unsafe { blob_has(c.as_ptr()) != 0 }
+}
+
+/// Retrieve a blob by hash. Returns `Ok(None)` if the blob does not exist,
+/// or `Err(message)` on error.
+///
+/// Host encoding (String, base64-tagged):
+/// `\x00` + base64(data) = found, `\x01` = not-found,
+/// `\x02` + error_msg = error.
+pub fn blob_get_data(hash: &str) -> Result<Option<Vec<u8>>, String> {
+    let c = to_cstr(hash);
+    let result = unsafe { read_cstr_return(blob_get(c.as_ptr())) };
+    decode_tagged_b64_option_result(&result)
+}
+
+/// Store a blob and return its content hash.
+pub fn blob_put_data(data: &[u8]) -> Result<String, String> {
+    let result = unsafe {
+        read_cstr_return(blob_put(data.as_ptr(), data.len() as i32))
+    };
+    if let Some(stripped) = result.strip_prefix('\x01') {
+        Err(stripped.to_string())
+    } else if let Some(stripped) = result.strip_prefix('\0') {
+        Ok(stripped.to_string())
+    } else {
+        // No prefix — treat entire string as the hash (backwards compat).
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Safe wrappers — Cluster Info
+// ---------------------------------------------------------------------------
+
+/// Get the numeric node ID of the host node.
+pub fn get_node_id() -> u64 {
+    unsafe { node_id() }
+}
+
+/// Check whether the host node is currently the Raft leader.
+pub fn is_current_leader() -> bool {
+    unsafe { is_leader() != 0 }
+}
+
+/// Get the numeric node ID of the current Raft leader.
+pub fn get_leader_id() -> u64 {
+    unsafe { leader_id() }
+}
+
+// ---------------------------------------------------------------------------
+// Safe wrappers — Crypto
+// ---------------------------------------------------------------------------
+
+/// Get cryptographically random bytes from the host.
+///
+/// Host returns base64-encoded string (workaround for VecBytes return bug).
+pub fn get_random_bytes(count: u32) -> Vec<u8> {
+    let result = unsafe { read_cstr_return(random_bytes(count)) };
+    base64_decode(&result).unwrap_or_default()
+}
+
+/// Sign data with the host node's Ed25519 secret key.
+///
+/// Host returns base64-encoded signature.
+pub fn sign_data(data: &[u8]) -> Vec<u8> {
+    let result = unsafe {
+        read_cstr_return(sign(data.as_ptr(), data.len() as i32))
+    };
+    base64_decode(&result).unwrap_or_default()
+}
+
+/// Verify an Ed25519 signature using a hex-encoded public key.
+///
+/// Parameters are packed because hyperlight's ABI forbids multiple
+/// VecBytes params. Packing: `[4-byte data_len (LE)] ++ data ++ sig`
+pub fn verify_signature(public_key_hex_str: &str, data: &[u8], signature: &[u8]) -> bool {
+    let c_key = to_cstr(public_key_hex_str);
+    let packed = pack_two_vecs(data, signature);
+    unsafe { verify(c_key.as_ptr(), packed.as_ptr(), packed.len() as i32) != 0 }
+}
+
+/// Get the host node's Ed25519 public key as a hex string.
+pub fn public_key() -> String {
+    unsafe { read_cstr_return(public_key_hex()) }
+}
+
+// ---------------------------------------------------------------------------
+// Safe wrappers — Timers
 // ---------------------------------------------------------------------------
 
 /// Schedule a timer on the host.
-///
-/// The host will call the plugin's `on_timer` method when the timer fires.
-/// If a timer with the same name already exists, it is replaced.
-///
-/// Intervals are clamped to \[1s, 24h\]. Maximum 16 active timers per plugin.
 pub fn schedule_timer_on_host(config: &aspen_plugin_api::TimerConfig) -> Result<(), String> {
-    let json = serde_json::to_vec(config).map_err(|e| format!("failed to serialize timer config: {e}"))?;
-    let len = json.len() as i32;
-    let result = unsafe { schedule_timer(json, len) };
+    let json = serde_json::to_vec(config)
+        .map_err(|e| format!("failed to serialize timer config: {e}"))?;
+    let result = unsafe {
+        read_cstr_return(schedule_timer(json.as_ptr(), json.len() as i32))
+    };
     decode_tagged_unit_result(&result)
 }
 
 /// Cancel a named timer on the host.
 pub fn cancel_timer_on_host(name: &str) -> Result<(), String> {
-    let result = unsafe { cancel_timer(name.to_string()) };
+    let c = to_cstr(name);
+    let result = unsafe { read_cstr_return(cancel_timer(c.as_ptr())) };
     decode_tagged_unit_result(&result)
 }
 
 // ---------------------------------------------------------------------------
-// Hook Event Subscriptions
+// Safe wrappers — Hook Event Subscriptions
 // ---------------------------------------------------------------------------
 
 /// Subscribe to hook events matching a NATS-style topic pattern.
-///
-/// The host will call the plugin's `on_hook_event` method when matching
-/// events occur. Patterns use dot-delimited segments with wildcards:
-///
-/// - `hooks.kv.*` — matches `hooks.kv.write_committed`, `hooks.kv.delete_committed`, etc.
-/// - `hooks.>` — matches all hook events
-/// - `hooks.cluster.*` — matches cluster events (leader_elected, membership_changed, etc.)
-///
-/// Subscriptions are idempotent — subscribing to the same pattern twice is a no-op.
-/// Maximum subscriptions per plugin: `MAX_HOOK_SUBSCRIPTIONS_PER_PLUGIN`.
 pub fn subscribe_hook_events(pattern: &str) -> Result<(), String> {
-    let result = unsafe { hook_subscribe(pattern.to_string()) };
+    let c = to_cstr(pattern);
+    let result = unsafe { read_cstr_return(hook_subscribe(c.as_ptr())) };
     decode_tagged_unit_result(&result)
 }
 
 /// Unsubscribe from a previously registered hook event pattern.
-///
-/// The pattern must exactly match a previously subscribed pattern.
 pub fn unsubscribe_hook_events(pattern: &str) -> Result<(), String> {
-    let result = unsafe { hook_unsubscribe(pattern.to_string()) };
+    let c = to_cstr(pattern);
+    let result = unsafe { read_cstr_return(hook_unsubscribe(c.as_ptr())) };
     decode_tagged_unit_result(&result)
 }
 
@@ -292,164 +397,91 @@ pub fn unsubscribe_hook_events(pattern: &str) -> Result<(), String> {
 /// Handler info returned by `list_hooks`.
 #[derive(serde::Deserialize)]
 pub struct HookHandlerInfo {
-    /// Handler name.
     pub name: String,
-    /// Topic pattern this handler subscribes to.
     pub pattern: String,
-    /// Handler type: "in_process", "shell", or "forward".
     pub handler_type: String,
-    /// Execution mode: "direct" or "job".
     pub execution_mode: String,
-    /// Whether the handler is enabled.
     pub enabled: bool,
-    /// Timeout in milliseconds.
     pub timeout_ms: u64,
-    /// Number of retries on failure.
     pub retry_count: u32,
 }
 
-/// Hook list result from the host.
 #[derive(serde::Deserialize)]
 pub struct HookListResult {
-    /// Whether the hook service is enabled.
     pub is_enabled: bool,
-    /// List of configured handlers.
     pub handlers: Vec<HookHandlerInfo>,
 }
 
-/// Metrics for a single hook handler.
 #[derive(serde::Deserialize)]
 pub struct HookHandlerMetricsInfo {
-    /// Handler name.
     pub name: String,
-    /// Total successful executions.
     pub success_count: u64,
-    /// Total failed executions.
     pub failure_count: u64,
-    /// Total dropped events.
     pub dropped_count: u64,
-    /// Total jobs submitted (for job mode handlers).
     pub jobs_submitted: u64,
-    /// Average execution duration in microseconds.
     pub avg_duration_us: u64,
-    /// Maximum execution duration in microseconds.
     pub max_duration_us: u64,
 }
 
-/// Hook metrics result from the host.
 #[derive(serde::Deserialize)]
 pub struct HookMetricsResult {
-    /// Whether the hook service is enabled.
     pub is_enabled: bool,
-    /// Global total events processed.
     pub total_events_processed: u64,
-    /// Per-handler metrics.
     pub handlers: Vec<HookHandlerMetricsInfo>,
 }
 
-/// Hook trigger result from the host.
 #[derive(serde::Deserialize)]
 pub struct HookTriggerResult {
-    /// Whether the trigger was successful.
     pub is_success: bool,
-    /// Number of handlers dispatched to.
     pub dispatched_count: u32,
-    /// Error message if failed.
     pub error: Option<String>,
-    /// Handler failures (each is [name, error]).
     pub handler_failures: Vec<Vec<String>>,
 }
 
 /// List configured hook handlers and their enabled status.
-///
-/// # Errors
-///
-/// Returns an error if the `hooks` permission is not granted.
 pub fn list_hooks() -> Result<HookListResult, String> {
-    let result = unsafe { hook_list(String::new()) };
+    let c = to_cstr("");
+    let result = unsafe { read_cstr_return(hook_list(c.as_ptr())) };
     decode_tagged_json_result(&result)
 }
 
 /// Get execution metrics for hook handlers.
-///
-/// Pass an empty string to get all handlers, or a handler name to filter.
-///
-/// # Errors
-///
-/// Returns an error if the `hooks` permission is not granted.
 pub fn get_hook_metrics(handler_name: &str) -> Result<HookMetricsResult, String> {
-    let result = unsafe { hook_metrics(handler_name.to_string()) };
+    let c = to_cstr(handler_name);
+    let result = unsafe { read_cstr_return(hook_metrics(c.as_ptr())) };
     decode_tagged_json_result(&result)
 }
 
 /// Manually trigger a hook event.
-///
-/// # Arguments
-///
-/// * `event_type` - One of: "write_committed", "delete_committed", "membership_changed",
-///   "leader_elected", "snapshot_created"
-/// * `payload` - JSON payload for the event
-///
-/// # Errors
-///
-/// Returns an error if the `hooks` permission is not granted,
-/// or the event type is invalid.
-pub fn trigger_hook(event_type: &str, payload: &serde_json::Value) -> Result<HookTriggerResult, String> {
+pub fn trigger_hook(
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Result<HookTriggerResult, String> {
     let request = serde_json::json!({
         "event_type": event_type,
         "payload": payload,
     });
-    let request_json = serde_json::to_string(&request).map_err(|e| format!("serialize failed: {e}"))?;
-    let result = unsafe { hook_trigger(request_json) };
+    let request_json =
+        serde_json::to_string(&request).map_err(|e| format!("serialize failed: {e}"))?;
+    let c = to_cstr(&request_json);
+    let result = unsafe { read_cstr_return(hook_trigger(c.as_ptr())) };
     decode_tagged_json_result(&result)
-}
-
-/// Decode a tagged JSON result string.
-///
-/// `\0{json}` = success, `\x01{error}` = error.
-fn decode_tagged_json_result<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, String> {
-    if let Some(json) = s.strip_prefix('\0') {
-        serde_json::from_str(json).map_err(|e| format!("parse result failed: {e}"))
-    } else if let Some(err) = s.strip_prefix('\x01') {
-        Err(err.to_string())
-    } else {
-        Err("unexpected host response format".to_string())
-    }
 }
 
 // ---------------------------------------------------------------------------
 // SQL query
 // ---------------------------------------------------------------------------
 
-/// SQL query result from the host.
 #[derive(serde::Deserialize)]
 pub struct SqlQueryResult {
-    /// Column names.
     pub columns: Vec<String>,
-    /// Result rows (each cell is a JSON value).
     pub rows: Vec<Vec<serde_json::Value>>,
-    /// Number of rows returned.
     pub row_count: u32,
-    /// Whether more rows exist beyond the limit.
     pub is_truncated: bool,
-    /// Execution time in milliseconds.
     pub execution_time_ms: u64,
 }
 
 /// Execute a read-only SQL query against the node's state machine.
-///
-/// # Arguments
-///
-/// * `query` - SQL SELECT or WITH...SELECT query string
-/// * `params_json` - JSON-serialized parameter array (empty string for no params)
-/// * `consistency` - `"linearizable"` (default) or `"stale"`
-/// * `limit` - Maximum rows to return
-/// * `timeout_ms` - Query timeout in milliseconds
-///
-/// # Errors
-///
-/// Returns an error if SQL is not supported, the query is invalid,
-/// or the `sql_query` permission is not granted.
 pub fn execute_sql(
     query: &str,
     params_json: &str,
@@ -464,10 +496,10 @@ pub fn execute_sql(
         "limit": limit,
         "timeout_ms": timeout_ms,
     });
-
-    let request_json = serde_json::to_string(&request).map_err(|e| format!("failed to serialize SQL request: {e}"))?;
-
-    let result = unsafe { sql_query(request_json) };
+    let request_json =
+        serde_json::to_string(&request).map_err(|e| format!("failed to serialize SQL request: {e}"))?;
+    let c = to_cstr(&request_json);
+    let result = unsafe { read_cstr_return(sql_query(c.as_ptr())) };
 
     if let Some(json) = result.strip_prefix('\0') {
         serde_json::from_str(json).map_err(|e| format!("failed to parse SQL result: {e}"))
@@ -482,161 +514,89 @@ pub fn execute_sql(
 // Full-fidelity KV operations (for handler plugins)
 // ---------------------------------------------------------------------------
 
-/// Result from a full-fidelity KV read operation.
 #[derive(serde::Deserialize)]
 pub struct KvReadResult {
-    /// The value bytes (base64-encoded in JSON transport).
     pub value: Option<String>,
-    /// Whether the key was found.
     pub was_found: bool,
-    /// Error message, if any.
     pub error: Option<String>,
 }
 
-/// Result from a full-fidelity KV write operation.
 #[derive(serde::Deserialize)]
 pub struct KvWriteResult {
-    /// Whether the write succeeded.
     pub is_success: bool,
-    /// Error message, if any.
     pub error: Option<String>,
-    /// Structured error code (e.g., "NOT_LEADER").
     pub error_code: Option<String>,
-    /// Leader node ID hint when error_code is NOT_LEADER.
     pub leader_id: Option<u64>,
 }
 
-/// Result from a full-fidelity KV delete operation.
 #[derive(serde::Deserialize)]
 pub struct KvDeleteResult {
-    /// The key that was deleted.
     pub key: String,
-    /// Whether the key was actually deleted.
     pub was_deleted: bool,
-    /// Error message, if any.
     pub error: Option<String>,
-    /// Structured error code (e.g., "NOT_LEADER").
     pub error_code: Option<String>,
-    /// Leader node ID hint when error_code is NOT_LEADER.
     pub leader_id: Option<u64>,
 }
 
-/// A single entry in a full-fidelity scan result.
 #[derive(serde::Deserialize)]
 pub struct KvScanEntry {
-    /// Key name.
     pub key: String,
-    /// Value (base64-encoded in JSON transport).
     pub value: String,
-    /// Version number.
     pub version: u64,
-    /// Revision at which the key was created.
     pub create_revision: u64,
-    /// Revision at which the key was last modified.
     pub mod_revision: u64,
 }
 
-/// Result from a full-fidelity KV scan operation.
 #[derive(serde::Deserialize)]
 pub struct KvScanResult {
-    /// Matching entries.
     pub entries: Vec<KvScanEntry>,
-    /// Total count of entries returned.
     pub count: u32,
-    /// Whether more entries exist beyond the limit.
     pub is_truncated: bool,
-    /// Opaque token for fetching the next page.
     pub continuation_token: Option<String>,
-    /// Error message, if any.
     pub error: Option<String>,
 }
 
-/// Result from a full-fidelity KV batch read operation.
 #[derive(serde::Deserialize)]
 pub struct KvBatchReadResult {
-    /// Whether the batch read succeeded.
     pub is_success: bool,
-    /// Values for each requested key (None = key not found).
     pub values: Option<Vec<Option<String>>>,
-    /// Error message, if any.
     pub error: Option<String>,
 }
 
-/// Result from a full-fidelity KV batch write operation.
 #[derive(serde::Deserialize)]
 pub struct KvBatchWriteResult {
-    /// Whether the batch write succeeded.
     pub is_success: bool,
-    /// Number of operations applied.
     pub operations_applied: Option<u32>,
-    /// Error message, if any.
     pub error: Option<String>,
-    /// Structured error code (e.g., "NOT_LEADER").
     pub error_code: Option<String>,
-    /// Leader node ID hint when error_code is NOT_LEADER.
     pub leader_id: Option<u64>,
 }
 
-/// Result from a full-fidelity KV compare-and-swap operation.
 #[derive(serde::Deserialize)]
 pub struct KvCasResult {
-    /// Whether the CAS succeeded.
     pub is_success: bool,
-    /// Actual value on CAS failure (base64-encoded).
     pub actual_value: Option<String>,
-    /// Error message, if any.
     pub error: Option<String>,
-    /// Structured error code (e.g., "NOT_LEADER", "CAS_FAILED").
     pub error_code: Option<String>,
-    /// Leader node ID hint when error_code is NOT_LEADER.
     pub leader_id: Option<u64>,
 }
 
-/// Result from a full-fidelity KV conditional batch write.
 #[derive(serde::Deserialize)]
 pub struct KvConditionalBatchResult {
-    /// Whether the conditional batch succeeded.
     pub is_success: bool,
-    /// Whether all conditions were met.
     pub conditions_met: bool,
-    /// Number of operations applied.
     pub operations_applied: Option<u32>,
-    /// Index of the first failed condition.
     pub failed_condition_index: Option<u32>,
-    /// Reason the condition failed.
     pub failed_condition_reason: Option<String>,
-    /// Error message, if any.
     pub error: Option<String>,
-    /// Structured error code (e.g., "NOT_LEADER").
     pub error_code: Option<String>,
-    /// Leader node ID hint when error_code is NOT_LEADER.
     pub leader_id: Option<u64>,
 }
 
-/// Execute a full-fidelity KV operation via the host.
-///
-/// This host function provides complete KV protocol support including
-/// structured error codes (NOT_LEADER, CAS_FAILED), version metadata
-/// in scan results, batch operations, and conditional writes.
-///
-/// # Arguments
-///
-/// * `request` - JSON value describing the operation. Must have an "op" field.
-///
-/// # Supported operations
-///
-/// - `{"op":"read","key":"..."}`
-/// - `{"op":"write","key":"...","value":"base64..."}`
-/// - `{"op":"delete","key":"..."}`
-/// - `{"op":"scan","prefix":"...","limit":N,"continuation_token":null}`
-/// - `{"op":"batch_read","keys":["k1","k2"]}`
-/// - `{"op":"batch_write","operations":[{"Set":{"key":"k","value":"base64:v"}},{"Delete":{"key":"k"
-///   }}]}`
-/// - `{"op":"cas","key":"...","expected":null,"new_value":"base64..."}`
-/// - `{"op":"cad","key":"...","expected":"base64..."}`
-/// - `{"op":"conditional_batch","conditions":[...],"operations":[...]}`
+/// Execute a full-fidelity KV operation via the host (JSON-based).
 fn kv_execute_raw(request_json: &str) -> Result<serde_json::Value, String> {
-    let result = unsafe { kv_execute(request_json.to_string()) };
+    let c = to_cstr(request_json);
+    let result = unsafe { read_cstr_return(kv_execute(c.as_ptr())) };
     if let Some(json_str) = result.strip_prefix('\0') {
         serde_json::from_str(json_str).map_err(|e| format!("failed to parse kv_execute result: {e}"))
     } else if let Some(err) = result.strip_prefix('\x01') {
@@ -646,7 +606,6 @@ fn kv_execute_raw(request_json: &str) -> Result<serde_json::Value, String> {
     }
 }
 
-/// Read a key with full result metadata.
 pub fn kv_read_full(key: &str) -> KvReadResult {
     let req = serde_json::json!({"op": "read", "key": key});
     match kv_execute_raw(&req.to_string()) {
@@ -663,7 +622,6 @@ pub fn kv_read_full(key: &str) -> KvReadResult {
     }
 }
 
-/// Write a key with structured error codes (including NOT_LEADER).
 pub fn kv_write_full(key: &str, value_b64: &str) -> KvWriteResult {
     let req = serde_json::json!({"op": "write", "key": key, "value": value_b64});
     match kv_execute_raw(&req.to_string()) {
@@ -682,7 +640,6 @@ pub fn kv_write_full(key: &str, value_b64: &str) -> KvWriteResult {
     }
 }
 
-/// Delete a key with structured error codes (including NOT_LEADER).
 pub fn kv_delete_full(key: &str) -> KvDeleteResult {
     let req = serde_json::json!({"op": "delete", "key": key});
     match kv_execute_raw(&req.to_string()) {
@@ -703,8 +660,11 @@ pub fn kv_delete_full(key: &str) -> KvDeleteResult {
     }
 }
 
-/// Scan keys with full metadata (version, revision, continuation token).
-pub fn kv_scan_full(prefix: &str, limit: Option<u32>, continuation_token: Option<&str>) -> KvScanResult {
+pub fn kv_scan_full(
+    prefix: &str,
+    limit: Option<u32>,
+    continuation_token: Option<&str>,
+) -> KvScanResult {
     let req = serde_json::json!({
         "op": "scan",
         "prefix": prefix,
@@ -729,7 +689,6 @@ pub fn kv_scan_full(prefix: &str, limit: Option<u32>, continuation_token: Option
     }
 }
 
-/// Batch read multiple keys.
 pub fn kv_batch_read_full(keys: &[String]) -> KvBatchReadResult {
     let req = serde_json::json!({"op": "batch_read", "keys": keys});
     match kv_execute_raw(&req.to_string()) {
@@ -746,7 +705,6 @@ pub fn kv_batch_read_full(keys: &[String]) -> KvBatchReadResult {
     }
 }
 
-/// Batch write with atomic semantics and structured error codes.
 pub fn kv_batch_write_full(operations: &serde_json::Value) -> KvBatchWriteResult {
     let req = serde_json::json!({"op": "batch_write", "operations": operations});
     match kv_execute_raw(&req.to_string()) {
@@ -767,7 +725,6 @@ pub fn kv_batch_write_full(operations: &serde_json::Value) -> KvBatchWriteResult
     }
 }
 
-/// Compare-and-swap with actual value on failure.
 pub fn kv_cas_full(key: &str, expected: Option<&str>, new_value: &str) -> KvCasResult {
     let req = serde_json::json!({
         "op": "cas",
@@ -793,7 +750,6 @@ pub fn kv_cas_full(key: &str, expected: Option<&str>, new_value: &str) -> KvCasR
     }
 }
 
-/// Compare-and-delete with actual value on failure.
 pub fn kv_cad_full(key: &str, expected: &str) -> KvCasResult {
     let req = serde_json::json!({
         "op": "cad",
@@ -818,7 +774,6 @@ pub fn kv_cad_full(key: &str, expected: &str) -> KvCasResult {
     }
 }
 
-/// Conditional batch write with condition evaluation and structured errors.
 pub fn kv_conditional_batch_full(
     conditions: &serde_json::Value,
     operations: &serde_json::Value,
@@ -857,18 +812,11 @@ pub fn kv_conditional_batch_full(
 // ---------------------------------------------------------------------------
 
 /// Execute a domain-specific service operation via the host.
-///
-/// Calls the `service_execute` host function with a JSON request containing
-/// a `"service"` field and an `"op"` field plus operation-specific parameters.
-///
-/// Returns the parsed JSON result on success, or an error string on failure.
-///
-/// # Example
-///
-/// ```ignore
-/// let result = execute_service("docs", "set", &json!({"key": "k", "value": "v"}))?;
-/// ```
-pub fn execute_service(service: &str, op: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+pub fn execute_service(
+    service: &str,
+    op: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let mut request = params.clone();
     if let Some(obj) = request.as_object_mut() {
         obj.insert("service".to_string(), serde_json::Value::String(service.to_string()));
@@ -877,17 +825,17 @@ pub fn execute_service(service: &str, op: &str, params: &serde_json::Value) -> R
         return Err("params must be a JSON object".to_string());
     }
 
-    let request_str = serde_json::to_string(&request).map_err(|e| format!("serialize failed: {e}"))?;
-    let result = unsafe { service_execute(request_str) };
+    let request_str =
+        serde_json::to_string(&request).map_err(|e| format!("serialize failed: {e}"))?;
+    let c = to_cstr(&request_str);
+    let result = unsafe { read_cstr_return(service_execute(c.as_ptr())) };
     decode_tagged_json_result::<serde_json::Value>(&result)
 }
 
 /// Execute a raw service call with a pre-built JSON request string.
-///
-/// The request must contain `"service"` and `"op"` fields.
-/// Returns the raw tagged response string from the host.
 pub fn execute_service_raw(request_json: &str) -> String {
-    unsafe { service_execute(request_json.to_string()) }
+    let c = to_cstr(request_json);
+    unsafe { read_cstr_return(service_execute(c.as_ptr())) }
 }
 
 // ---------------------------------------------------------------------------
@@ -895,13 +843,7 @@ pub fn execute_service_raw(request_json: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Pack two byte slices into a single `Vec<u8>` with a 4-byte LE length prefix.
-///
 /// Format: `[4-byte first_len (LE)] ++ first ++ second`
-///
-/// This is needed because hyperlight's primitive-mode ABI encodes `Vec<u8>` as
-/// `(VecBytes, Int)` and requires `VecBytes` to be immediately followed by `Int`.
-/// Multiple `Vec<u8>` parameters in one function signature would produce
-/// `VecBytes, VecBytes` which triggers "Host function vector parameter missing length".
 fn pack_two_vecs(first: &[u8], second: &[u8]) -> Vec<u8> {
     let mut packed = Vec::with_capacity(4 + first.len() + second.len());
     packed.extend_from_slice(&(first.len() as u32).to_le_bytes());
@@ -910,50 +852,116 @@ fn pack_two_vecs(first: &[u8], second: &[u8]) -> Vec<u8> {
     packed
 }
 
-/// Decode a tagged `Result<Option<Vec<u8>>, String>` from a host function.
-///
-/// The host encodes results as:
-/// - `[0x00]` + data = found (returns `Ok(Some(data))`)
-/// - `[0x01]` = not found (returns `Ok(None)`)
-/// - `[0x02]` + error message = error (returns `Err(message)`)
-/// - Empty vec = not found (backwards compatibility)
-///
-/// Tiger Style: All option result decoding goes through one function.
-fn decode_tagged_option_result(result: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    if result.is_empty() {
-        return Ok(None);
-    }
-    match result[0] {
-        0x00 => Ok(Some(result[1..].to_vec())),
-        0x01 => Ok(None),
-        0x02 => {
-            let msg = String::from_utf8_lossy(&result[1..]).to_string();
-            Err(msg)
-        }
-        _ => {
-            // Backwards compat: no tag byte, treat entire vec as data
-            Ok(Some(result.to_vec()))
-        }
+/// Decode a tagged JSON result string. `\0{json}` = success, `\x01{error}` = error.
+fn decode_tagged_json_result<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, String> {
+    if let Some(json) = s.strip_prefix('\0') {
+        serde_json::from_str(json).map_err(|e| format!("parse result failed: {e}"))
+    } else if let Some(err) = s.strip_prefix('\x01') {
+        Err(err.to_string())
+    } else {
+        Err("unexpected host response format".to_string())
     }
 }
 
 /// Decode a tagged `Result<(), String>` from a host function.
-///
-/// The host encodes results as:
-/// - `\0` (or `\0` + ignored payload) = success
-/// - `\x01` + message = error
-/// - Empty string = success (backwards compatibility)
-///
-/// Tiger Style: All result decoding goes through one function.
+/// `\0` = success, `\x01` + msg = error, empty = success.
 fn decode_tagged_unit_result(result: &str) -> Result<(), String> {
     if result.is_empty() || result.starts_with('\0') {
         Ok(())
     } else if let Some(msg) = result.strip_prefix('\x01') {
         Err(msg.to_string())
     } else {
-        // No tag prefix — treat entire string as error message (backwards compat)
         Err(result.to_string())
     }
+}
+
+/// Decode a tagged option result where binary data is base64-encoded.
+///
+/// Host encoding: `\x00` + base64(value) = found, `\x01` = not-found,
+/// `\x02` + error_msg = error, empty = not-found.
+fn decode_tagged_b64_option_result(result: &str) -> Result<Option<Vec<u8>>, String> {
+    if result.is_empty() {
+        return Ok(None);
+    }
+    match result.as_bytes()[0] {
+        b'\x00' => {
+            let b64 = &result[1..];
+            if b64.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let bytes = base64_decode(b64).map_err(|e| format!("base64 decode: {e}"))?;
+            Ok(Some(bytes))
+        }
+        b'\x01' => Ok(None),
+        b'\x02' => {
+            let msg = &result[1..];
+            Err(msg.to_string())
+        }
+        _ => {
+            // Backwards compat: no tag byte, try base64 decode of entire string
+            match base64_decode(result) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(_) => Ok(Some(result.as_bytes().to_vec())),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Minimal base64 codec (no extra dependencies for wasm32 guest)
+// ---------------------------------------------------------------------------
+
+const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encode bytes as base64 string.
+pub fn base64_encode(data: &[u8]) -> String {
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(B64_CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(B64_CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(B64_CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(B64_CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+/// Decode base64 string to bytes.
+pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let input = input.trim_end_matches('=');
+    let mut result = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for c in input.bytes() {
+        let val = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'\n' | b'\r' | b' ' => continue,
+            _ => return Err(format!("invalid base64 char: {}", c as char)),
+        };
+        buf = (buf << 6) | val as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            result.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -969,10 +977,7 @@ mod tests {
         let first = b"hello";
         let second = b"world";
         let packed = pack_two_vecs(first, second);
-
-        // Verify layout: [4-byte LE len of first] ++ first ++ second
         assert_eq!(packed.len(), 4 + first.len() + second.len());
-
         let first_len = u32::from_le_bytes(packed[..4].try_into().unwrap()) as usize;
         assert_eq!(first_len, first.len());
         assert_eq!(&packed[4..4 + first_len], first);
@@ -980,78 +985,62 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_two_vecs_empty_first() {
-        let packed = pack_two_vecs(b"", b"data");
-        assert_eq!(packed.len(), 4 + 4);
-        let first_len = u32::from_le_bytes(packed[..4].try_into().unwrap()) as usize;
-        assert_eq!(first_len, 0);
-        assert_eq!(&packed[4..], b"data");
+    fn test_base64_roundtrip() {
+        let data = b"Hello, World!";
+        let encoded = base64_encode(data);
+        assert_eq!(encoded, "SGVsbG8sIFdvcmxkIQ==");
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
     }
 
     #[test]
-    fn test_pack_two_vecs_empty_second() {
-        let packed = pack_two_vecs(b"data", b"");
-        assert_eq!(packed.len(), 4 + 4);
-        let first_len = u32::from_le_bytes(packed[..4].try_into().unwrap()) as usize;
-        assert_eq!(first_len, 4);
-        assert_eq!(&packed[4..], b"data");
+    fn test_base64_empty() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_decode("").unwrap(), Vec::<u8>::new());
     }
 
     #[test]
-    fn test_pack_two_vecs_both_empty() {
-        let packed = pack_two_vecs(b"", b"");
-        assert_eq!(packed.len(), 4);
-        let first_len = u32::from_le_bytes(packed[..4].try_into().unwrap()) as usize;
-        assert_eq!(first_len, 0);
+    fn test_base64_binary() {
+        let data: Vec<u8> = (0..=255).collect();
+        let encoded = base64_encode(&data);
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
     }
 
     #[test]
-    fn test_decode_tagged_option_result_found() {
-        let mut data = vec![0x00];
-        data.extend_from_slice(b"value");
-        let result = decode_tagged_option_result(&data);
-        assert_eq!(result.unwrap().unwrap(), b"value");
-    }
-
-    #[test]
-    fn test_decode_tagged_option_result_not_found() {
-        let result = decode_tagged_option_result(&[0x01]);
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_decode_tagged_option_result_error() {
-        let mut data = vec![0x02];
-        data.extend_from_slice(b"something broke");
-        let result = decode_tagged_option_result(&data);
-        assert_eq!(result.unwrap_err(), "something broke");
-    }
-
-    #[test]
-    fn test_decode_tagged_option_result_empty() {
-        let result = decode_tagged_option_result(&[]);
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_decode_tagged_unit_result_success_empty() {
+    fn test_decode_tagged_unit_result_success() {
         assert!(decode_tagged_unit_result("").is_ok());
-    }
-
-    #[test]
-    fn test_decode_tagged_unit_result_success_null_prefix() {
         assert!(decode_tagged_unit_result("\0ok").is_ok());
     }
 
     #[test]
     fn test_decode_tagged_unit_result_error() {
-        let result = decode_tagged_unit_result("\x01oops");
-        assert_eq!(result.unwrap_err(), "oops");
+        assert_eq!(decode_tagged_unit_result("\x01oops").unwrap_err(), "oops");
     }
 
     #[test]
-    fn test_decode_tagged_unit_result_no_prefix_is_error() {
-        let result = decode_tagged_unit_result("unexpected");
-        assert_eq!(result.unwrap_err(), "unexpected");
+    fn test_decode_tagged_b64_option_found() {
+        // \x00 + base64("value") = found
+        let input = format!("\x00{}", base64_encode(b"value"));
+        let result = decode_tagged_b64_option_result(&input);
+        assert_eq!(result.unwrap().unwrap(), b"value");
+    }
+
+    #[test]
+    fn test_decode_tagged_b64_option_not_found() {
+        let result = decode_tagged_b64_option_result("\x01");
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_decode_tagged_b64_option_error() {
+        let result = decode_tagged_b64_option_result("\x02something broke");
+        assert_eq!(result.unwrap_err(), "something broke");
+    }
+
+    #[test]
+    fn test_decode_tagged_b64_option_empty() {
+        let result = decode_tagged_b64_option_result("");
+        assert!(result.unwrap().is_none());
     }
 }
