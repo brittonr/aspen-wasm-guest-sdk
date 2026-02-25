@@ -106,30 +106,31 @@ fn to_cstr(s: &str) -> CString {
 ///
 /// # Safety
 /// The pointer must be valid and point to a NUL-terminated string in guest memory.
-/// Hyperlight allocates this via guest malloc; we need to free it eventually.
+///
+/// Hyperlight's `hl_return_to_val` allocates this via guest `malloc` but does NOT
+/// track it in `RETURN_VALUE_ALLOCATIONS` (that tracking is only for guest function
+/// return values, not host function return values). The guest should free it.
+///
+/// On wasm32, we call the exported `free` from `register_plugin!` which reads
+/// the malloc header to recover the correct size. On non-wasm (tests), no-op.
 unsafe fn read_cstr_return(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
     let cstr = unsafe { CStr::from_ptr(ptr) };
     let s = cstr.to_string_lossy().into_owned();
-    // Free the allocation made by hyperlight's hl_return_to_val.
-    // The host allocated this in guest memory via malloc.
-    unsafe { dealloc(ptr as *mut u8, cstr.to_bytes_with_nul().len()) };
-    s
-}
 
-/// Free memory allocated by hyperlight in guest space.
-///
-/// Hyperlight's hl_return_to_val uses the guest's exported malloc to allocate
-/// return values. We free via the standard allocator since we're in the same
-/// address space. Actually, hyperlight tracks return allocations and frees them
-/// on the next VM entry (free_return_value_allocations), so we DON'T need to
-/// free here — hyperlight handles it.
-unsafe fn dealloc(_ptr: *mut u8, _len: usize) {
-    // Hyperlight automatically frees return value allocations on next VM entry.
-    // See wasm_runtime/src/marshal.rs: free_return_value_allocations()
-    // Calling free here would double-free.
+    // Free the allocation made by hyperlight's hl_return_to_val via guest malloc.
+    // The exported free() from register_plugin! reads the size header.
+    #[cfg(target_arch = "wasm32")]
+    {
+        unsafe extern "C" {
+            fn free(ptr: i32);
+        }
+        unsafe { free(ptr as i32) };
+    }
+
+    s
 }
 
 // ---------------------------------------------------------------------------

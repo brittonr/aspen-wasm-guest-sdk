@@ -168,25 +168,79 @@ macro_rules! register_plugin {
     ($plugin_type:ty) => {
         // -----------------------------------------------------------------
         // Memory management exports required by hyperlight-wasm
+        //
+        // Hyperlight's wasm_runtime calls guest `malloc` to allocate and
+        // `free` to release memory in the guest's linear memory space.
+        //
+        // CRITICAL: Rust's wasm32 allocator (dlmalloc) requires the EXACT
+        // Layout (size + align) at dealloc time — `free(ptr, size, align)`
+        // uses the size to locate adjacent chunk metadata. Passing the wrong
+        // size corrupts dlmalloc's free lists and causes heap corruption,
+        // leading to GeneralProtectionFault on subsequent allocations.
+        //
+        // Solution: malloc stores the original allocation size in an 8-byte
+        // header before the returned pointer. free reads the header to
+        // recover the correct size for deallocation.
+        //
+        // Layout: [4 bytes: total_size as u32][4 bytes: padding] [user data...]
+        //          ^raw ptr                                       ^returned ptr
         // -----------------------------------------------------------------
 
+        /// Size of the allocation header prepended by malloc.
+        /// 4 bytes for size + 4 bytes padding = 8-byte aligned.
+        const _ALLOC_HEADER: usize = 8;
+
         /// Export malloc for hyperlight to allocate in guest memory.
+        ///
+        /// Prepends an 8-byte header storing the total allocation size so
+        /// that `free` can pass the correct Layout to `dealloc`.
         #[unsafe(no_mangle)]
         pub extern "C" fn malloc(size: i32) -> i32 {
-            let layout = std::alloc::Layout::from_size_align(size as usize, 8).unwrap();
-            let ptr = unsafe { std::alloc::alloc(layout) };
-            ptr as i32
+            if size < 0 {
+                return 0;
+            }
+            let user_size = size as usize;
+            // Overflow check: user_size + header must not wrap on u32
+            let total = match user_size.checked_add(_ALLOC_HEADER) {
+                Some(t) => t,
+                None => return 0,
+            };
+            let layout = match std::alloc::Layout::from_size_align(total, 8) {
+                Ok(l) => l,
+                Err(_) => return 0,
+            };
+            let raw = unsafe { std::alloc::alloc(layout) };
+            if raw.is_null() {
+                return 0;
+            }
+            // Store total allocation size in the header
+            unsafe { std::ptr::write(raw as *mut u32, total as u32) };
+            // Return pointer past the header — this is where the caller writes data
+            (raw as usize + _ALLOC_HEADER) as i32
         }
 
         /// Export free for hyperlight to deallocate guest memory.
+        ///
+        /// Reads the allocation size from the header prepended by `malloc`
+        /// and passes the correct Layout to the Rust allocator.
         #[unsafe(no_mangle)]
         pub extern "C" fn free(ptr: i32) {
-            // We can't know the exact size, but for wasm32 linear memory
-            // the allocator tracks sizes internally. Use a minimal layout.
-            if ptr != 0 {
-                let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
-                unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+            if ptr == 0 {
+                return;
             }
+            let user_ptr = ptr as usize;
+            // Step back past the header to the raw allocation start
+            let raw = (user_ptr - _ALLOC_HEADER) as *mut u8;
+            let total = unsafe { std::ptr::read(raw as *const u32) } as usize;
+            // Sanity check: total must be at least the header size
+            if total < _ALLOC_HEADER {
+                return; // Corrupted header — don't crash, just leak
+            }
+            let layout = match std::alloc::Layout::from_size_align(total, 8) {
+                Ok(l) => l,
+                Err(_) => return, // Invalid layout — don't crash, just leak
+            };
+            unsafe { std::alloc::dealloc(raw, layout) };
         }
 
         // -----------------------------------------------------------------
@@ -203,21 +257,25 @@ macro_rules! register_plugin {
 
         /// Helper: return VecBytes to hyperlight.
         /// Format: [4-byte LE size] + data, returns pointer.
+        ///
+        /// Uses the exported `malloc` (which prepends a size header) so that
+        /// hyperlight's `free_return_value_allocations` can correctly free
+        /// this buffer via the exported `free`.
         fn _return_vecbytes(data: &[u8]) -> i32 {
             let total = 4 + data.len();
-            let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
-            let ptr = unsafe { std::alloc::alloc(layout) };
-            if ptr.is_null() {
+            let ptr = malloc(total as i32);
+            if ptr == 0 {
                 return 0;
             }
             unsafe {
-                // Write 4-byte LE length prefix
+                let raw = ptr as *mut u8;
+                // Write 4-byte LE length prefix (VecBytes protocol)
                 let len_bytes = (data.len() as i32).to_le_bytes();
-                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), ptr, 4);
+                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), raw, 4);
                 // Write data
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+                std::ptr::copy_nonoverlapping(data.as_ptr(), raw.add(4), data.len());
             }
-            ptr as i32
+            ptr
         }
 
         #[unsafe(no_mangle)]
