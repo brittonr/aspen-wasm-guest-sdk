@@ -152,16 +152,77 @@ pub trait AspenPlugin {
     fn on_hook_event(_topic: &str, _event: &[u8]) {}
 }
 
-/// Register a plugin type by generating the `handle_request` and `plugin_info`
-/// FFI exports that the host expects.
+/// Register a plugin type by generating the FFI exports that the host expects.
 ///
-/// The macro deserializes the incoming JSON bytes, dispatches to the plugin's
-/// `handle` method, and serializes the response back to JSON bytes.
+/// # ABI Contract
+///
+/// Hyperlight calls guest functions with parameters marshalled through guest memory.
+/// For VecBytes params: hyperlight calls guest `malloc`, writes bytes, passes
+/// `(ptr: i32, len: i32)`. The guest reads the data and must `free` the allocation.
+/// For VecBytes returns: the guest allocates `[4-byte LE size] + data`, returns the
+/// pointer as i32. Hyperlight reads it and tracks it for later freeing.
+///
+/// The guest MUST export `malloc`, `free`, and `memory` for this to work.
 #[macro_export]
 macro_rules! register_plugin {
     ($plugin_type:ty) => {
+        // -----------------------------------------------------------------
+        // Memory management exports required by hyperlight-wasm
+        // -----------------------------------------------------------------
+
+        /// Export malloc for hyperlight to allocate in guest memory.
         #[unsafe(no_mangle)]
-        pub extern "C" fn handle_request(input: Vec<u8>) -> Vec<u8> {
+        pub extern "C" fn malloc(size: i32) -> i32 {
+            let layout = std::alloc::Layout::from_size_align(size as usize, 8).unwrap();
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            ptr as i32
+        }
+
+        /// Export free for hyperlight to deallocate guest memory.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn free(ptr: i32) {
+            // We can't know the exact size, but for wasm32 linear memory
+            // the allocator tracks sizes internally. Use a minimal layout.
+            if ptr != 0 {
+                let layout = std::alloc::Layout::from_size_align(1, 1).unwrap();
+                unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Guest function exports
+        // -----------------------------------------------------------------
+
+        /// Helper: read VecBytes from hyperlight's (ptr, len) pair.
+        fn _read_vecbytes(ptr: i32, len: i32) -> Vec<u8> {
+            if len <= 0 || ptr == 0 {
+                return Vec::new();
+            }
+            unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec() }
+        }
+
+        /// Helper: return VecBytes to hyperlight.
+        /// Format: [4-byte LE size] + data, returns pointer.
+        fn _return_vecbytes(data: &[u8]) -> i32 {
+            let total = 4 + data.len();
+            let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            if ptr.is_null() {
+                return 0;
+            }
+            unsafe {
+                // Write 4-byte LE length prefix
+                let len_bytes = (data.len() as i32).to_le_bytes();
+                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), ptr, 4);
+                // Write data
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+            }
+            ptr as i32
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn handle_request(input_ptr: i32, input_len: i32) -> i32 {
+            let input = _read_vecbytes(input_ptr, input_len);
             let request: $crate::ClientRpcRequest = match serde_json::from_slice(&input) {
                 Ok(r) => r,
                 Err(e) => {
@@ -169,66 +230,69 @@ macro_rules! register_plugin {
                         "PLUGIN_DESERIALIZE_ERROR",
                         &format!("failed to deserialize request: {e}"),
                     ));
-                    return serde_json::to_vec(&err).unwrap_or_default();
+                    let out = serde_json::to_vec(&err).unwrap_or_default();
+                    return _return_vecbytes(&out);
                 }
             };
             let response = <$plugin_type as $crate::AspenPlugin>::handle(request);
-            serde_json::to_vec(&response).unwrap_or_default()
+            let out = serde_json::to_vec(&response).unwrap_or_default();
+            _return_vecbytes(&out)
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn plugin_info(_input: Vec<u8>) -> Vec<u8> {
+        pub extern "C" fn plugin_info(input_ptr: i32, input_len: i32) -> i32 {
+            let _ = (input_ptr, input_len);
             let info = <$plugin_type as $crate::AspenPlugin>::info();
-            serde_json::to_vec(&info).unwrap_or_default()
+            let out = serde_json::to_vec(&info).unwrap_or_default();
+            _return_vecbytes(&out)
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn plugin_init(_input: Vec<u8>) -> Vec<u8> {
-            match <$plugin_type as $crate::AspenPlugin>::init() {
-                Ok(()) => {
-                    // Return JSON: {"ok": true}
-                    serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default()
-                }
-                Err(e) => {
-                    // Return JSON: {"ok": false, "error": "message"}
-                    serde_json::to_vec(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default()
-                }
-            }
+        pub extern "C" fn plugin_init(input_ptr: i32, input_len: i32) -> i32 {
+            let _ = (input_ptr, input_len);
+            let out = match <$plugin_type as $crate::AspenPlugin>::init() {
+                Ok(()) => serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default(),
+                Err(e) => serde_json::to_vec(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default(),
+            };
+            _return_vecbytes(&out)
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn plugin_shutdown(_input: Vec<u8>) -> Vec<u8> {
+        pub extern "C" fn plugin_shutdown(input_ptr: i32, input_len: i32) -> i32 {
+            let _ = (input_ptr, input_len);
             <$plugin_type as $crate::AspenPlugin>::shutdown();
-            serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default()
+            let out = serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default();
+            _return_vecbytes(&out)
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn plugin_health(_input: Vec<u8>) -> Vec<u8> {
-            match <$plugin_type as $crate::AspenPlugin>::health() {
-                Ok(()) => {
-                    serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default()
-                }
-                Err(e) => {
-                    serde_json::to_vec(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default()
-                }
-            }
+        pub extern "C" fn plugin_health(input_ptr: i32, input_len: i32) -> i32 {
+            let _ = (input_ptr, input_len);
+            let out = match <$plugin_type as $crate::AspenPlugin>::health() {
+                Ok(()) => serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default(),
+                Err(e) => serde_json::to_vec(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default(),
+            };
+            _return_vecbytes(&out)
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn plugin_on_timer(input: Vec<u8>) -> Vec<u8> {
+        pub extern "C" fn plugin_on_timer(input_ptr: i32, input_len: i32) -> i32 {
+            let input = _read_vecbytes(input_ptr, input_len);
             let name: String = serde_json::from_slice(&input).unwrap_or_default();
             <$plugin_type as $crate::AspenPlugin>::on_timer(&name);
-            serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default()
+            let out = serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default();
+            _return_vecbytes(&out)
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn plugin_on_hook_event(input: Vec<u8>) -> Vec<u8> {
-            // Input is JSON: {"topic": "...", "event": {...}}
+        pub extern "C" fn plugin_on_hook_event(input_ptr: i32, input_len: i32) -> i32 {
+            let input = _read_vecbytes(input_ptr, input_len);
             let parsed: serde_json::Value = serde_json::from_slice(&input).unwrap_or_default();
             let topic = parsed["topic"].as_str().unwrap_or("");
             let event_bytes = serde_json::to_vec(&parsed["event"]).unwrap_or_default();
             <$plugin_type as $crate::AspenPlugin>::on_hook_event(topic, &event_bytes);
-            serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default()
+            let out = serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap_or_default();
+            _return_vecbytes(&out)
         }
     };
 }
